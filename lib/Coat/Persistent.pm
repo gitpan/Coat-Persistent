@@ -2,31 +2,61 @@ package Coat::Persistent;
 
 use Coat;
 use Coat::Meta;
-use Scalar::Util 'blessed';
-
-use Scalar::Util 'looks_like_number';
+use Cache::FastMmap;
+use Scalar::Util qw(blessed looks_like_number);
 use DBI;
 use DBD::CSV;
 use Carp 'confess';
+use Digest::MD5 qw(md5_base64);
 
 use vars qw($VERSION @EXPORT $AUTHORITY);
 use base qw(Exporter);
 
+$VERSION   = '0.0_0.2';
 $AUTHORITY = 'cpan:SUKRIA';
-$VERSION   = '0.0_0.1';
-@EXPORT    = qw(has_p owns_one owns_many);
+@EXPORT    = qw(has_p has_one has_many);
 
 # Static method & stuff
 
-my $MAPPINGS = {};
-my $FIELDS   = {};
+# configuration place-holders
+my $MAPPINGS    = {};
+my $CONSTRAINTS = {};
 
+# static accessors
 sub mappings { $MAPPINGS }
-sub dbh { $MAPPINGS->{'!dbh'}{ $_[0] } || $MAPPINGS->{'!dbh'}{'!default'} }
-
-sub driver {
-    $MAPPINGS->{'!driver'}{ $_[0] } || $MAPPINGS->{'!driver'}{'!default'};
+sub dbh { 
+    $MAPPINGS->{'!dbh'}{ $_[0] }    || 
+    $MAPPINGS->{'!dbh'}{'!default'} ||
+    undef
 }
+sub driver {
+    $MAPPINGS->{'!driver'}{ $_[0] }    || 
+    $MAPPINGS->{'!driver'}{'!default'} ||
+    undef;
+}
+sub cache {
+    $MAPPINGS->{'!cache'}{ $_[0] }    ||
+    $MAPPINGS->{'!cache'}{'!default'} || 
+    undef;
+}
+
+sub enable_cache {
+    my ($class, %options) = @_;
+    $class = '!default' if $class eq 'Coat::Persistent';
+
+    # default cache configuration
+    $options{expire_time} ||= '1h';
+    $options{cache_size}  ||= '10m';
+
+    $MAPPINGS->{'!cache'}{$class} = new Cache::FastMmap %options;
+}
+
+sub disable_cache {
+    my ($class) = @_;
+    $class = '!default' if $class eq 'Coat::Persistent';
+    undef $MAPPINGS->{'!cache'}{$class};
+}
+
 
 # This is the configration stuff, you basically bind a class to
 # a DBI driver
@@ -52,28 +82,51 @@ sub map_to_dbi {
       DBI->connect( "${driver}:${table}", $user, $pass );
 }
 
+
+
 # The generic SQL finder, takes a SQL query and map rows returned
 # to objects of the class
 sub find_by_sql {
     my ( $class, $sql, @values ) = @_;
+    my @objects;
 
-    my $dbh = $class->dbh;
-    my $sth = $dbh->prepare($sql);
-    $sth->execute(@values) or confess "Unable to execute query $sql";
-    my $rows = $sth->fetchall_arrayref( {} );
+    my $cache_key = md5_base64($sql . (@values ? join(',', @values) : ''));
 
-    my @objects = map {
-        my $obj = $class->new;
+    # if cached, try to returned a cached value
+    if (defined $class->cache) {
+        my $value = $class->cache->get($cache_key);
+        @objects = @$value if defined $value;
+    }
 
-        # column returned by the query that are valid attrs are set,
-        # other are set as virtual attr (without the accessor).
-        foreach my $attr ( keys %$_ ) {
-            Coat::Meta->has( $class, $attr )
-              ? $obj->$attr( $_->{$attr} )
-              : $obj->{$attr} = $_->{$attr};
+    # no cache found, perform the query
+    unless (@objects) {
+        my $dbh = $class->dbh;
+        my $sth = $dbh->prepare($sql);
+        $sth->execute(@values) or confess "Unable to execute query $sql";
+        my $rows = $sth->fetchall_arrayref( {} );
+
+        @objects = map {
+            my $obj = $class->new;
+
+            # column returned by the query that are valid attrs are set,
+            # other are set as virtual attr (without the accessor).
+            foreach my $attr ( keys %$_ ) {
+                Coat::Meta->has( $class, $attr )
+                  ? $obj->$attr( $_->{$attr} )
+                  : $obj->{$attr} = $_->{$attr};
+            }
+            $obj;
+        } @$rows;
+        
+        # save to the cache if needed
+        if (defined $class->cache) {
+            unless ($class->cache->set($cache_key, \@objects)) {
+                warn "Unable to write to cache for key : $cache_key ".
+                     "; maybe upgrade the cache_size : $!";
+            }
         }
-        $obj;
-    } @$rows;
+    }
+
     return wantarray
       ? @objects
       : $objects[0];
@@ -86,6 +139,11 @@ sub has_p {
     my $caller = $options{'!caller'} || caller;
     confess "package main called has_p" if $caller eq 'main';
 
+    # unique field ?
+    $CONSTRAINTS->{'!unique'}{$caller}{$attr} = $options{unique} || 0;
+    # syntax check ?
+    $CONSTRAINTS->{'!syntax'}{$caller}{$attr} = $options{syntax} || undef;
+
     Coat::has( $attr, ( '!caller' => $caller, %options ) );
 
     my $finder = sub {
@@ -94,7 +152,8 @@ sub has_p {
         confess "Cannot find without a value" unless defined $value;
 
         my $table = $class->_to_sql;
-        $class->find_by_sql( "select * from $table where $attr = ?", $value );
+
+        return $class->find_by_sql("select * from $table where $attr = ?", $value);
     };
     _bind_code_to_symbol( $finder, "${caller}::find_by_${attr}" );
 }
@@ -111,18 +170,35 @@ sub import {
     Coat::Persistent->export_to_level( 1, @_ );
 }
 
+# find() is a polymorphic method that can behaves in several ways accroding 
+# to the arguments passed.
+#
+# Class->find() : returns all rows (select * from class)
+# Class->find(12) : returns the row where id = 12
+# Class->find("condition") : returns the row(s) where condition
+# Class->find(["condition ?", $val]) returns the row(s) where condition
+
 sub find {
     my ( $class, $value ) = @_;
     confess "Cannot be called from an instance" if ref $class;
-    ( defined $value )
-      ? (
-        ( looks_like_number $value )
-        ? $class->find_by_id($value)
-        : $class->find_by_sql(
-            "select * from " . $class->_to_sql . " where " . $value
-        )
-      )
-      : $class->find_by_sql( "select * from " . $class->_to_sql );
+    if (defined $value) {
+        if (ref $value) {
+            confess "Cannot handle non-aray references" if ref($value) ne 'ARRAY';
+            my ($sql, @values) = @$value;
+            $class->find_by_sql("select * from "
+                              . $class->_to_sql
+                              . " where $sql", @values);
+        }
+        else {
+            ( looks_like_number $value )
+            ? $class->find_by_id($value)
+            : $class->find_by_sql("select * from ".$class->_to_sql." where $value");
+
+        }
+    }
+    else {
+       $class->find_by_sql( "select * from " . $class->_to_sql );
+    }
 }
 
 # let's you define a relation like A.b_id -> B
@@ -131,14 +207,14 @@ sub find {
 # example :
 #   package A;
 #   ...
-#   owns_one 'foo';
+#   has_one 'foo';
 #   ...
 #   my $a = new A;
 #   my $f = $a->foo
 #
 # TODO : later let the user override the bindings
 
-sub owns_one {
+sub has_one {
     my ($owned_class)   = @_;
     my $class           = caller;
     my $owned_class_sql = _to_sql($owned_class);
@@ -173,8 +249,8 @@ sub owns_one {
 # many relations means an instance of class A owns many instances
 # of class B:
 #     $a->bs returns B->find_by_a_id($a->id)
-# * B must provide a 'owns_one A' statement for this to work
-sub owns_many {
+# * B must provide a 'has_one A' statement for this to work
+sub has_many {
     my ($owned_class)   = @_;
     my $class           = caller;
     my $class_sql       = _to_sql($class);
@@ -205,6 +281,115 @@ sub owns_many {
     };
     _bind_code_to_symbol( $code, "${class}::${owned_class_sql}s" );
 }
+
+sub validate {
+    my ($self, @args) = @_;
+    my $class = ref($self);
+    
+    foreach my $attr (keys %{ Coat::Meta->all_attributes($class)} ) {
+        # checking for syntax validation
+        if (defined $CONSTRAINTS->{'!syntax'}{$class}{$attr}) {
+            my $regexp = $CONSTRAINTS->{'!syntax'}{$class}{$attr};
+            confess "Value \"".$self->$attr."\" for attribute \"$attr\" is not valid"
+                unless $self->$attr =~ /$regexp/;
+        }
+        
+        # checking for unique attributes on inserting (new objects)
+        if ((! defined $self->id) && 
+            $CONSTRAINTS->{'!unique'}{$class}{$attr}) {
+            # look for other instances that already have that attribute
+            my @items = $class->find(["$attr = ?", $self->$attr]);
+            confess "Value ".$self->$attr." violates unique constraint "
+                  . "for attribute $attr (class $class)"
+                if @items;
+        }
+    }
+
+}
+
+sub delete {
+    my ($self, $id) = @_;
+    my $class  = ref $self || $self;
+    my $dbh    = $class->dbh;
+
+    confess "Cannot delete without an id" 
+        if (!ref $self && !defined $id);
+    
+    confess "Cannot delete without a mapping defined for class " . ref $self
+      unless defined $dbh;
+
+    $id = $self->id if ref($self);
+
+    confess "Cannot delete without a defined id" 
+        unless defined $id;
+
+    $dbh->do("delete from ".$class->_to_sql." where id = $id");
+}
+
+# serialize the instance and save it with the mapper defined
+sub save {
+    my ($self) = @_;
+    my $class  = ref $self;
+    my $dbh    = $class->dbh;
+
+    confess "Cannot save without a mapping defined for class " . ref $self
+      unless defined $dbh;
+
+    # first call validate to check the object is sane
+    $self->validate();
+
+    my $table = $self->_to_sql;
+    my @values;
+    my @fields = keys %{ Coat::Meta->all_attributes( ref $self ) };
+
+    # if we have an id, update
+    if ( defined $self->id ) {
+        @values = map { $self->$_ } @fields;
+        my $sql =
+            "update $table set "
+          . join( ", ", map { "$_ = ?" } @fields )
+          . " where id = ?";
+
+        my $sth = $dbh->prepare($sql);
+        $sth->execute( @values, $self->id )
+          or confess "Unable to execute query \"$sql\" : $!";
+    }
+
+    # no id, insert with a valid id
+    else {
+        $self->_lock_write;
+        $self->id( $self->_next_id );
+
+        my $sql =
+            "insert into $table ("
+          . ( join ", ", @fields )
+          . ") values ("
+          . ( join ", ", map { '?' } @fields ) . ")";
+
+        foreach my $field (@fields) {
+            push @values, $self->$field;
+        }
+
+        my $sth = $dbh->prepare($sql);
+        $sth->execute(@values)
+          or confess "Unable to execute query : \"$sql\" with "
+          . join( ", ", @values ) . " : $!";
+        $self->_unlock;
+    }
+
+    # if subobjects defined, save them
+    if ( $self->{_subobjects} ) {
+        foreach my $obj ( @{ $self->{_subobjects} } ) {
+            $obj->save;
+        }
+        delete $self->{_subobjects};
+    }
+    return $self->id;
+}
+
+
+##############################################################################
+# Private methods
 
 # instance method & stuff
 sub _bind_code_to_symbol {
@@ -267,63 +452,7 @@ sub _next_id {
       : 1;
 }
 
-# serialize the instance and save it with the mapper defined
-sub save {
-    my ($self) = @_;
-    my $class  = ref $self;
-    my $dbh    = $class->dbh;
 
-    confess "Cannot save without a mapping defined for class " . ref $self
-      unless defined $dbh;
-
-    my $table = $self->_to_sql;
-    my @values;
-    my @fields = keys %{ Coat::Meta->all_attributes( ref $self ) };
-
-    # if we have an id, update
-    if ( defined $self->id ) {
-        @values = map { $self->$_ } @fields;
-        my $sql =
-            "update $table set "
-          . join( ", ", map { "$_ = ?" } @fields )
-          . " where id = ?";
-
-        my $sth = $dbh->prepare($sql);
-        $sth->execute( @values, $self->id )
-          or confess "Unable to execute query \"$sql\" : $!";
-    }
-
-    # no id, insert with a valid id
-    else {
-        $self->_lock_write;
-        $self->id( $self->_next_id );
-
-        my $sql =
-            "insert into $table ("
-          . ( join ", ", @fields )
-          . ") values ("
-          . ( join ", ", map { '?' } @fields ) . ")";
-
-        foreach my $field (@fields) {
-            push @values, $self->$field;
-        }
-
-        my $sth = $dbh->prepare($sql);
-        $sth->execute(@values)
-          or confess "Unable to execute query : \"$sql\" with "
-          . join( ", ", @values ) . " : $!";
-        $self->_unlock;
-    }
-
-    # if subobjects defined, save them
-    if ( $self->{_subobjects} ) {
-        foreach my $obj ( @{ $self->{_subobjects} } ) {
-            $obj->save;
-        }
-        delete $self->{_subobjects};
-    }
-    return $self->id;
-}
 
 1;
 __END__
@@ -337,7 +466,7 @@ Coat::Persistent -- Simple Object-Relational mapping for Coat objects
 =head1 DESCRIPTION
 
 Coat::Persistent is an object to relational-databases mapper, it allows you to
-build instance of Coat objects and save them into a databse transparently.
+build instances of Coat objects and save them into a database transparently.
 
 You basically define a mapping rule, either global or per-class and play with
 your Coat objects without bothering with SQL for simple cases (selecting,
@@ -377,6 +506,8 @@ class mapped formated like said above.
 
 =head1 CONFIGURATION
 
+=head2 DBI MAPPING
+
 You have to tell Coat::Persistent how to map a class to a DBI driver. You can
 either choose to define a default mapper (in most of the cases this is what
 you want) or define a mapper for a specific class.
@@ -398,7 +529,7 @@ Supported values for B<$driver> are the following :
 
 =over 4
 
-=item I<csv> : this wil use DBI's "DBD:CSV" driver to map your instances to a CSV
+=item I<csv> : this will use DBI's "DBD:CSV" driver to map your instances to a CSV
 file. B<@options> must contains a string as its first element being like the
 following: "f_dir=<DIRECTORY>" where DIRECTORY is the directory where to store
 de CSV files.
@@ -421,6 +552,49 @@ Example:
 
 =back
 
+=head2 CACHING
+
+Since version 0.0_0.2, Coat::Persistent provides a simple way to cache the
+results of underlying SQL requests. By default, no cache is performed.
+
+You can either choose to enable the caching system for all the classes (global
+cache) or for a specific class. You could also define different cache
+configurations for each class.
+
+When the cache is enabled, every SQL query generated by Coat::Persistent is
+first looked through the cache collection. If the query is found, its cached
+result is returned; if not, the query is executed with the appropriate DBI
+mapper and the result is cached.
+
+The backend used by Coat::Persistent for caching is L<Cache::FastMmap> which
+is able to expire the data on his own. Coat::Persistent lets you access the
+Cache::FastMmap object through a static accessor :
+
+=over 4
+
+=item B<Coat::Persistent-E<gt>cache> : return the default cache object
+
+=item B<__PACKAGE__-E<gt>cache> : return the cache object for the class __PACKAGE__
+
+=back
+
+To set a global cache system, use the static method B<enable_cache>. This
+method receives a hash table with options to pass to the Cache::FastMmap
+constructor.
+
+Example :
+
+    Coat::Persistent->enable_cache(
+        expire_time => '1h',
+        cache_size  => '50m',
+        share_file  => '/var/cache/myapp.cache',
+    );
+
+It's possible to disable the cache system with the static method
+B<disable_cache>.
+
+See L<Cache::FastMmap> for details about available constructor's options.
+
 =head1 METHODS
 
 =over 4
@@ -434,7 +608,7 @@ take the same options as Coat's B<has> method. (Refer to L<Coat> for details).
 All attributes declared with B<has_p> must exist in the mapped data backend
 (they are a column of the table mapped to the class).
 
-=item B<owns_one $class>
+=item B<has_one $class>
 
 Tells that current class owns a subobject of the class $class. This will allow
 you to set and get a subobject transparently.
@@ -446,7 +620,7 @@ Example:
     package Foo;
     use Coat::Persistent;
 
-    owns_one 'Bar';
+    has_one 'Bar';
 
     package Bar;
     use Coat::Persistent;
@@ -454,16 +628,17 @@ Example:
     my $foo = new Foo;
     $foo->bar(new Bar);
 
-=item B<owns_many $class>
+=item B<has_many $class>
 
-This is the same as owns_one but says that many items are bound to one
+This is the same as has_one but says that many items are bound to one
 instance of the current class.
 
 The backend of class $class must provide a foreign key to the current class.
 
 =head1 SEE ALSO
 
-See L<Coat> for all the meta-class documentation.
+See L<Coat> for all the meta-class documentation. See L<Cache::FastMmap> for
+details about the cache objects provided.
 
 =head1 AUTHOR
 
