@@ -1,14 +1,13 @@
 use strict;
 use warnings;
-use Test::More 'no_plan';
-use Test::Exception;
+use Test::More tests => 2;
 
 BEGIN { use_ok 'Coat::Persistent' }
 {
     package Person;
     use Coat;
     use Coat::Persistent;
-    has_p name => (isa => 'Str', unique => 1);
+    has_p name => (isa => 'Str', required => 1, is => 'ro');
     has_p age  => (isa => 'Int');
 }
 
@@ -22,12 +21,9 @@ foreach my $name ('Joe', 'John', 'Brenda') {
     $p->save;
 }
 
-# tests
-throws_ok {
-    my $p = new Person name => 'Joe'; 
-    $p->save;
-} qr/Value Joe violates unique constraint for attribute name \(class Person\)/, 
-'unable to save a person with name "Joe" : unique value already taken';
+# test
+my $p = Person->find(1);
+ok( defined $p, '$p is found' );
 
 # clean
 $dbh->do("DROP TABLE person");

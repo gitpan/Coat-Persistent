@@ -2,17 +2,17 @@ package Coat::Persistent;
 
 use Coat;
 use Coat::Meta;
-use Cache::FastMmap;
 use Scalar::Util qw(blessed looks_like_number);
+use List::Compare;
 use DBI;
-use DBD::CSV;
+use DBIx::Sequence;
 use Carp 'confess';
 use Digest::MD5 qw(md5_base64);
 
 use vars qw($VERSION @EXPORT $AUTHORITY);
 use base qw(Exporter);
 
-$VERSION   = '0.0_0.2';
+$VERSION   = '0.0_0.3';
 $AUTHORITY = 'cpan:SUKRIA';
 @EXPORT    = qw(has_p has_one has_many);
 
@@ -44,11 +44,18 @@ sub enable_cache {
     my ($class, %options) = @_;
     $class = '!default' if $class eq 'Coat::Persistent';
 
+    # first, try to use Cache::FastMmap
+    eval "use Cache::FastMmap";
+    confess "Unable to load Cache::FastMmap : $@" if $@;
+
+    # importing the module
+    Cache::FastMmap->import;
+
     # default cache configuration
     $options{expire_time} ||= '1h';
     $options{cache_size}  ||= '10m';
 
-    $MAPPINGS->{'!cache'}{$class} = new Cache::FastMmap %options;
+    $MAPPINGS->{'!cache'}{$class} = Cache::FastMmap->new( %options );
 }
 
 sub disable_cache {
@@ -74,12 +81,25 @@ sub map_to_dbi {
     confess "No such driver : $driver"
       unless exists $drivers->{$driver};
 
+    # the csv driver needs to load the appropriate DBD module
+    if ($driver eq 'csv') {
+        eval "use DBD::CSV";
+        confess "Unable to load DBD::CSV : $@" if $@;
+        DBD::CSV->import;
+    }
+
     $MAPPINGS->{'!driver'}{$class} = $driver;
 
     my ( $table, $user, $pass ) = @options;
     $driver = $drivers->{$driver};
     $MAPPINGS->{'!dbh'}{$class} =
-      DBI->connect( "${driver}:${table}", $user, $pass );
+      DBI->connect( "${driver}:${table}", $user, $pass, { PrintError => 0, RaiseError => 0 });
+       
+    confess "Can't connect to database ${DBI::err} : ${DBI::errstr}"
+        unless $MAPPINGS->{'!dbh'}{$class};
+
+    # if the DBIx::Sequence tables don't exist, create them
+    _create_dbix_sequence_tables($MAPPINGS->{'!dbh'}{$class});
 }
 
 
@@ -102,21 +122,29 @@ sub find_by_sql {
     unless (@objects) {
         my $dbh = $class->dbh;
         my $sth = $dbh->prepare($sql);
-        $sth->execute(@values) or confess "Unable to execute query $sql";
+        $sth->execute(@values) 
+            or confess "Unable to execute query $sql : " . 
+               $DBI::err . ' : ' . $DBI::errstr;
         my $rows = $sth->fetchall_arrayref( {} );
 
-        @objects = map {
-            my $obj = $class->new;
+        # if any rows, let's process them
+        if (@$rows) {
+            # we have to find out which fields are real attributes
+            my $class_attr = Coat::Meta->all_attributes( $class );
+            my @attrs = keys %$class_attr;
+            
+            # from the columns selected, where are real attributes and virtual ones?
+            my $lc = new List::Compare(\@attrs, [keys %{ $rows->[0] }]);
+            my @given_attr   = $lc->get_intersection;
+            my @virtual_attr = $lc->get_symdiff;
 
-            # column returned by the query that are valid attrs are set,
-            # other are set as virtual attr (without the accessor).
-            foreach my $attr ( keys %$_ ) {
-                Coat::Meta->has( $class, $attr )
-                  ? $obj->$attr( $_->{$attr} )
-                  : $obj->{$attr} = $_->{$attr};
+            # create the object with attributes, and set virtual ones
+            foreach my $r (@$rows) {
+                my $obj = $class->new(map { ($_ => $r->{$_}) } @given_attr);
+                $obj->{$_} = $r->{$_} for @virtual_attr;
+                push @objects, $obj;
             }
-            $obj;
-        } @$rows;
+        }
         
         # save to the cache if needed
         if (defined $class->cache) {
@@ -357,7 +385,6 @@ sub save {
 
     # no id, insert with a valid id
     else {
-        $self->_lock_write;
         $self->id( $self->_next_id );
 
         my $sql =
@@ -372,9 +399,8 @@ sub save {
 
         my $sth = $dbh->prepare($sql);
         $sth->execute(@values)
-          or confess "Unable to execute query : \"$sql\" with "
-          . join( ", ", @values ) . " : $!";
-        $self->_unlock;
+          or confess "Unable to execute query : \"$sql\"  : [$!] with "
+          . join( ", ", @values );
     }
 
     # if subobjects defined, save them
@@ -434,25 +460,46 @@ sub _unlock {
 
 sub _next_id {
     my ($self) = @_;
-
     my $class = ref $self;
-    my $dbh   = $class->dbh;
+    
     my $table = $self->_to_sql;
+    my $dbh   = $class->dbh;
 
-    my $sth =
-      $dbh->prepare( "select id as last_id "
-          . "from $table "
-          . "order by last_id "
-          . "desc limit 1" );
-    $sth->execute;
-    my $row = $sth->fetchrow_hashref;
-
-    return ( $row->{last_id} )
-      ? ( $row->{last_id} + 1 )
-      : 1;
+    my $sequence = new DBIx::Sequence({ dbh => $dbh });
+    my $id = $sequence->Next($table);
+    return $id;
 }
 
+# DBIx::Sequence needs two tables in the schema,
+# this private function create them if needed.
+sub _create_dbix_sequence_tables($) {
+    my ($dbh) = @_;
 
+    # dbix_sequence_state exists ?
+    unless (_table_exists($dbh, 'dbix_sequence_state')) {
+        # nope, create!
+        $dbh->do("CREATE TABLE dbix_sequence_state (dataset varchar(50), state_id int(11))")
+            or confess "Unable to create table dbix_sequence_state $DBI::errstr";
+    }
+
+    # dbix_sequence_release exists ?
+    unless (_table_exists($dbh, 'dbix_sequence_release')) {
+        # nope, create!
+        $dbh->do("CREATE TABLE dbix_sequence_release (dataset varchar(50), released_id int(11))")
+            or confess "Unable to create table dbix_sequence_release $DBI::errstr";
+    }
+}
+
+# This is the best way I found to check if a table exists, with a portable SQL
+# If you have better, tell me!
+sub _table_exists($$) {
+    my ($dbh, $table) = @_;
+    my $sth = $dbh->prepare("select count(*) from $table");
+    return 0 unless defined $sth;
+    $sth->execute or return 0;
+    my $nb_rows = $sth->fetchrow_hashref;
+    return defined $nb_rows;
+}
 
 1;
 __END__
