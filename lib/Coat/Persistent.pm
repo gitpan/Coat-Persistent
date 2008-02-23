@@ -6,17 +6,20 @@ use Scalar::Util qw(blessed looks_like_number);
 use List::Compare;
 use DBI;
 use DBIx::Sequence;
+use SQL::Abstract;
 use Carp 'confess';
 use Digest::MD5 qw(md5_base64);
 
 use vars qw($VERSION @EXPORT $AUTHORITY);
 use base qw(Exporter);
 
+# Module meta-data
 $VERSION   = '0.0_0.3';
 $AUTHORITY = 'cpan:SUKRIA';
 @EXPORT    = qw(has_p has_one has_many);
 
-# Static method & stuff
+# The SQL::Abstract object
+my $sql_abstract = SQL::Abstract->new;
 
 # configuration place-holders
 my $MAPPINGS    = {};
@@ -110,10 +113,9 @@ sub find_by_sql {
     my ( $class, $sql, @values ) = @_;
     my @objects;
 
-    my $cache_key = md5_base64($sql . (@values ? join(',', @values) : ''));
-
     # if cached, try to returned a cached value
     if (defined $class->cache) {
+        my $cache_key = md5_base64($sql . (@values ? join(',', @values) : ''));
         my $value = $class->cache->get($cache_key);
         @objects = @$value if defined $value;
     }
@@ -148,6 +150,7 @@ sub find_by_sql {
         
         # save to the cache if needed
         if (defined $class->cache) {
+            my $cache_key = md5_base64($sql . (@values ? join(',', @values) : ''));
             unless ($class->cache->set($cache_key, \@objects)) {
                 warn "Unable to write to cache for key : $cache_key ".
                      "; maybe upgrade the cache_size : $!";
@@ -178,10 +181,9 @@ sub has_p {
         my ( $class, $value ) = @_;
         confess "Cannot be called from an instance" if ref $class;
         confess "Cannot find without a value" unless defined $value;
-
         my $table = $class->_to_sql;
-
-        return $class->find_by_sql("select * from $table where $attr = ?", $value);
+        my ($sql, @values) = $sql_abstract->select($table, '*', {$attr => $value});
+        return $class->find_by_sql($sql, @values);
     };
     _bind_code_to_symbol( $finder, "${caller}::find_by_${attr}" );
 }
@@ -207,25 +209,30 @@ sub import {
 # Class->find(["condition ?", $val]) returns the row(s) where condition
 
 sub find {
-    my ( $class, $value ) = @_;
+    my ( $class, $value, @rest ) = @_;
     confess "Cannot be called from an instance" if ref $class;
+
     if (defined $value) {
         if (ref $value) {
-            confess "Cannot handle non-aray references" if ref($value) ne 'ARRAY';
+            confess "Cannot handle non-array references" if ref($value) ne 'ARRAY';
+            # we don't use SQL::Abstract there, because we have a SQL
+            # statement with "?" and a list of values
             my ($sql, @values) = @$value;
             $class->find_by_sql("select * from "
                               . $class->_to_sql
                               . " where $sql", @values);
         }
+        # we don't have a list, so let's find out what's given 
         else {
+            # the first item looks like a number (then it's an ID)
             ( looks_like_number $value )
-            ? $class->find_by_id($value)
-            : $class->find_by_sql("select * from ".$class->_to_sql." where $value");
-
+            ?  $class->find_by_sql( $sql_abstract->select( $class->_to_sql, '*', { id => [$value, @rest] }) )
+            # else, it a user-defined SQL condition
+            : $class->find_by_sql($sql_abstract->select($class->_to_sql, '*', $value));
         }
     }
     else {
-       $class->find_by_sql( "select * from " . $class->_to_sql );
+       $class->find_by_sql( $sql_abstract->select( $class->_to_sql, '*' ) );
     }
 }
 
@@ -354,6 +361,26 @@ sub delete {
     $dbh->do("delete from ".$class->_to_sql." where id = $id");
 }
 
+# create is an alias for new + save, it can hande simple 
+# and multiple creation.
+# Class->create( foo => 'x', bar => 'y'); # simple creation
+# Class->create([ { foo => 'x' }, {...}, ... ]); # multiple creation
+sub create {
+    # if only two args, we should have an ARRAY containing HASH
+    if (@_ == 2) {
+        my ($class, $values) = @_;
+        confess "create received only two args but no ARRAY" 
+            unless ref($values) eq 'ARRAY';
+        $class->create(%$_) for @$values;
+    }
+    else {
+        my ($class, %values) = @_;
+        my $obj = $class->new(%values);
+        $obj->save;
+        $obj;
+    }
+}
+
 # serialize the instance and save it with the mapper defined
 sub save {
     my ($self) = @_;
@@ -367,40 +394,31 @@ sub save {
     $self->validate();
 
     my $table = $self->_to_sql;
-    my @values;
+    # all the attributes of the class
     my @fields = keys %{ Coat::Meta->all_attributes( ref $self ) };
+    # a hash containing attr/value pairs for the current object.
+    my %values = map { $_ => $self->$_ } @fields;
 
     # if we have an id, update
     if ( defined $self->id ) {
-        @values = map { $self->$_ } @fields;
-        my $sql =
-            "update $table set "
-          . join( ", ", map { "$_ = ?" } @fields )
-          . " where id = ?";
-
+        # generate the SQL
+        my ($sql, @values) = $sql_abstract->update($table, \%values, { id => $self->id});
+        # execute the query
         my $sth = $dbh->prepare($sql);
-        $sth->execute( @values, $self->id )
-          or confess "Unable to execute query \"$sql\" : $!";
+        $sth->execute( @values )
+          or confess "Unable to execute query \"$sql\" : $DBI::errstr";
     }
 
     # no id, insert with a valid id
     else {
+        # get our ID from the sequence
         $self->id( $self->_next_id );
-
-        my $sql =
-            "insert into $table ("
-          . ( join ", ", @fields )
-          . ") values ("
-          . ( join ", ", map { '?' } @fields ) . ")";
-
-        foreach my $field (@fields) {
-            push @values, $self->$field;
-        }
-
+        # generate the SQL
+        my ($sql, @values) = $sql_abstract->insert($table, { %values, id => $self->id });
+        # execute the query
         my $sth = $dbh->prepare($sql);
-        $sth->execute(@values)
-          or confess "Unable to execute query : \"$sql\"  : [$!] with "
-          . join( ", ", @values );
+        $sth->execute( @values )
+          or confess "Unable to execute query \"$sql\" : $DBI::errstr";
     }
 
     # if subobjects defined, save them
@@ -416,6 +434,7 @@ sub save {
 
 ##############################################################################
 # Private methods
+
 
 # instance method & stuff
 sub _bind_code_to_symbol {
@@ -538,6 +557,13 @@ although it is a developer release, it works pretty well and fit my needs.
 This module is expected to change in the future (don't consider the API to be
 stable at this time), and to grow (hopefully).
 
+The underlying target of this module is to port the whole ActiveRecord::Base
+API to Perl. If you find the challenge and the idea interesting, feel free to 
+contact me for giving a hand. 
+
+This is still a development version and should not be used in production
+environment. 
+
 =head1 DATA BACKEND
 
 The concept behing this module is the same behind the ORM of Rails : all your
@@ -644,6 +670,11 @@ See L<Cache::FastMmap> for details about available constructor's options.
 
 =head1 METHODS
 
+=head2 CLASS CONFIGURATION
+
+The following pragma are provided to configure the mapping that will be 
+done between a table and the class.
+
 =over 4
 
 =item B<has_p $name =E<gt> %options>
@@ -679,8 +710,98 @@ Example:
 
 This is the same as has_one but says that many items are bound to one
 instance of the current class.
-
 The backend of class $class must provide a foreign key to the current class.
+
+=back
+
+=head2 CLASS METHODS
+
+The following methods are inherited by Coat::Persistent classes, they provide
+features for accessing and touching the database below the abstraction layer.
+Those methods must be called in class-context.
+
+=over 4 
+
+=item B<find( @conditions )>
+
+Find operates with three different retrieval approaches:
+
+=over 8
+
+=item I<Find by id>: This can either be a specific id or a list of ids (1, 5,
+6)
+
+=item I<Find in scalar context>: This will return the first record matched by
+the options used. These options can either be specific conditions or merely an
+order. If no record can be matched, undef is returned.
+
+=item I<Find in list context>: This will return all the records matched by the
+options used. If no records are found, an empty array is returned.
+
+Example:
+
+    my $obj = Class->find(23);
+    my @list = Class->find(1, 23, 34, 54);
+    my $obj = Class->find("field = 'value'");
+    my $obj = Class->find(["field = ?", $value]);
+
+=back
+
+=item B<find_by_sql($sql, @bind_values>
+
+Executes a custom sql query against your database and returns all the results
+if in list context, only the first one if in scalar context.
+
+If you call a complicated SQL query which spans multiple tables the columns
+specified by the SELECT that aren't real attributes of your model will be
+provided in the hashref of the object, but you won't have accessors.
+
+The sql parameter is a full sql query as a string. It will be called as is,
+there will be no database agnostic conversions performed. This should be a
+last resort because using, for example, MySQL specific terms will lock you to
+using that particular database engine or require you to change your call if
+you switch engines.
+
+Example:
+
+    my $obj = Class->find_by_sql("select * from class where $cond");
+    my @obj = Class->find_by_sql("select * from class where col = ?", 34);
+
+=item B<create>
+
+Creates an object (or multiple objects) and saves it to the database. 
+
+The attributes parameter can be either be a hash or an array of hash-refs. These
+hashes describe the attributes on the objects that are to be created.
+
+Examples
+
+  # Create a single new object
+  User->create(first_name => 'Jamie')
+  
+  # Create an Array of new objects
+  User->create([{ first_name => 'Jamie'}, { first_name => 'Jeremy' }])
+
+
+=back
+
+=head2 INSTANCE METHODS
+
+The following methods are provided by objects created from the class.
+Those methods must be called in instance-context.
+
+=over 4 
+
+=item B<save>
+
+If no record exists, creates a new record with values matching those of the
+object attributes.
+If a record does exist, updates the record with values matching those
+of the object attributes.
+
+Returns the id of the object saved. 
+
+=back
 
 =head1 SEE ALSO
 
@@ -689,7 +810,12 @@ details about the cache objects provided.
 
 =head1 AUTHOR
 
-This module was written by Alexis Sukrieh E<lt>sukria+perl@sukria.netE<gt>.
+This module was written by Alexis Sukrieh E<lt>sukria@cpan.orgE<gt>.
+Quite everything implemented in this module was inspired from
+ActiveRecord::Base's API (from Ruby on Rails).
+
+Parts of the documentation are also taken from ActiveRecord::Base when
+appropriate.
 
 =head1 COPYRIGHT AND LICENSE
 
