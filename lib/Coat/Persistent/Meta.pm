@@ -8,11 +8,11 @@ use base 'Exporter';
 my $META = {};
 
 # supported meta attributes for models
-my @attributes = qw(table_name primary_key);
+my @attributes = qw(table_name primary_key accessor);
 
 # accessor to the meta information of a model
 # ex: Coat::Persistent::Meta->model('User')
-sub model { $META->{ $_[1] } }
+sub registry { $META->{ $_[1] } }
 
 # this is to avoid writing several times the same setters and 
 # writers for the class
