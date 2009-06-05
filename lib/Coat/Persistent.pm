@@ -18,11 +18,15 @@ use DBI;
 use DBIx::Sequence;
 use SQL::Abstract;
 
+# Constants
+use constant CP_ENTRY_NEW => 0;
+use constant CP_ENTRY_EXISTS => 1;
+
 # Module meta-data
 use vars qw($VERSION @EXPORT $AUTHORITY);
 use base qw(Exporter);
 
-$VERSION   = '0.102';
+$VERSION   = '0.104';
 $AUTHORITY = 'cpan:SUKRIA';
 @EXPORT    = qw(has_p has_one has_many);
 
@@ -75,6 +79,31 @@ sub disable_cache {
     undef $MAPPINGS->{'!cache'}{$class};
 }
 
+# A singleton that stores the driver/module mappings
+# The ones here are default drivers that are known to be compliant
+# with Coat::Persistent.
+# Any DBI driver should work though.
+my $drivers = {
+    csv    => 'DBI:CSV',
+    mysql  => 'dbi:mysql',
+    sqlite => 'dbi:SQLite',
+};
+sub drivers { $drivers }
+
+# Accessor to a driver
+sub get_driver {
+    my ($class, $driver) = @_;
+    confess "driver needed" unless $driver;
+    return $class->drivers->{$driver};
+}
+
+# This lets you add the DBI driver you want to use
+sub add_driver {
+    my ($class, $driver, $module) = @_;
+    confess "driver and module needed" unless $driver and $module;
+    $class->drivers->{$driver} = $module;
+}
+
 # This is the configration stuff, you basically bind a class to
 # a DBI driver
 sub map_to_dbi {
@@ -84,11 +113,9 @@ sub map_to_dbi {
     # if map_to_dbi is called from Coat::Persistent, this is the default dbh
     $class = '!default' if $class eq 'Coat::Persistent';
 
-    my $drivers = {
-        mysql => 'dbi:mysql',
-        csv   => 'DBI:CSV',
-    };
-    confess "No such driver : $driver"
+    my $drivers = Coat::Persistent->drivers;
+
+    confess "No such driver : $driver, please register the driver first with add_driver()"
       unless exists $drivers->{$driver};
 
     # the csv driver needs to load the appropriate DBD module
@@ -444,6 +471,7 @@ sub find_by_sql {
                     $obj->{$field} = $r->{$field};
                 }
 
+                $obj->{_db_state} = CP_ENTRY_EXISTS;
                 push @objects, $obj;
             }
         }
@@ -465,6 +493,11 @@ sub find_by_sql {
 
 
 sub init_on_find {
+}
+
+sub BUILD {
+    my ($self) = @_;
+    $self->{_db_state} = CP_ENTRY_NEW;
 }
 
 sub validate {
@@ -550,7 +583,7 @@ sub save {
     confess "Cannot save without a mapping defined for class " . ref $self
       unless defined $dbh;
 
-    # first call validate to check the object is sane
+    # make sure the object is sane
     $self->validate();
 
     # all the attributes of the class
@@ -558,8 +591,9 @@ sub save {
     # a hash containing attr/value pairs for the current object.
     my %values = map { $_ => $self->$_ } @fields;
 
-    # if we have an id, update
-    if ( defined $self->$primary_key ) {
+    # if not a new object, we have to update
+    if ( $self->_db_state == CP_ENTRY_EXISTS ) {
+
         # generate the SQL
         my ($sql, @values) = $sql_abstract->update(
             $table_name, \%values, { $primary_key => $self->$primary_key});
@@ -569,11 +603,17 @@ sub save {
           or confess "Unable to execute query \"$sql\" : $DBI::errstr";
     }
 
-    # no id, insert with a valid id
+    # new object, insert
     else {
+        # if the id has been touched, trigger an error, that's not possible
+        # with the use of DBIx::Sequence
+        if ($self->{id}) {
+            confess "The id has been set on a newborn object of class ".ref($self).", cannot save, id would change";
+        }
+
         # get our ID from the sequence
         $self->$primary_key( $self->_next_id );
-
+    
         # generate the SQL
         my ($sql, @values) = $sql_abstract->insert(
             $table_name, { %values, $primary_key => $self->$primary_key });
@@ -583,6 +623,8 @@ sub save {
         my $sth = $dbh->prepare($sql);
         $sth->execute( @values )
           or confess "Unable to execute query \"$sql\" : $DBI::errstr";
+
+        $self->{_db_state} = CP_ENTRY_EXISTS;
     }
 
     # if subobjects defined, save them
@@ -654,6 +696,13 @@ sub _next_id {
     my $sequence = new DBIx::Sequence({ dbh => $dbh });
     my $id = $sequence->Next($table);
     return $id;
+}
+
+# Returns a constant describing if the object exists or not
+# already in the underlying DB
+sub _db_state {
+    my ($self) = @_;
+    return $self->{_db_state} ||= CP_ENTRY_NEW;
 }
 
 # DBIx::Sequence needs two tables in the schema,
@@ -767,6 +816,34 @@ You can overide those conventions at import time:
 You have to tell Coat::Persistent how to map a class to a DBI driver. You can
 either choose to define a default mapper (in most of the cases this is what
 you want) or define a mapper for a specific class.
+
+In order for your mapping to be possible, the driver you use must be known by
+Coat::Persistent, you can modify its driver mapping matrix if needed.
+
+=over 4
+
+=item B<drivers( )>
+
+Return a hashref representing all the drivers mapped.
+
+  MyClass->drivers;
+
+=item B<get_driver( $name )>
+
+Return the Perl module of the driver defined for the given driver name.
+  
+  MyClass->get_driver( 'mysql' );
+
+=item B<add_driver( $name, $module )>
+
+Add or replace a driver mapping rule. 
+
+  MyClass->add_driver( sqlite => 'dbi:SQLite' );
+
+=back
+
+Then, you can use your driver in mapping rules. Basically, the mapping will
+generate a DBI-E<gt>connect() call.
 
 =over 4 
 
@@ -904,12 +981,6 @@ features for accessing and touching the database below the abstraction layer.
 Those methods must be called in class-context.
 
 =over 4 
-
-=item B<find( @conditions, \%options )>
-
-Find operates with three different retrieval approaches:
-
-=over 4
 
 =item I<Find by id>: This can either be a specific id or a list of ids (1, 5,
 6)
