@@ -4,6 +4,7 @@ package Coat::Persistent;
 use Coat;
 use Coat::Meta;
 use Coat::Persistent::Meta;
+use Coat::Persistent::Constraint;
 use Carp 'confess';
 
 use Data::Dumper;
@@ -26,7 +27,7 @@ use constant CP_ENTRY_EXISTS => 1;
 use vars qw($VERSION @EXPORT $AUTHORITY);
 use base qw(Exporter);
 
-$VERSION   = '0.104';
+$VERSION   = '0.200';
 $AUTHORITY = 'cpan:SUKRIA';
 @EXPORT    = qw(has_p has_one has_many);
 
@@ -35,7 +36,6 @@ my $sql_abstract = SQL::Abstract->new;
 
 # configuration place-holders
 my $MAPPINGS    = {};
-my $CONSTRAINTS = {};
 
 # static accessors
 sub mappings { $MAPPINGS }
@@ -53,6 +53,17 @@ sub cache {
     $MAPPINGS->{'!cache'}{ $_[0] }    ||
     $MAPPINGS->{'!cache'}{'!default'} || 
     undef;
+}
+
+# Access to the constraint meta data for the current class
+sub has_unique_constraint {
+    my ($class, $attr) = @_;
+    $class->has_constraint($attr, 'unique');
+}
+
+sub has_constraint {
+    my ($class, $attr, $constraint) = @_;
+    Coat::Persistent::Constraint->get_constraint($constraint, $class, $attr) || 0;
 }
 
 sub enable_cache {
@@ -139,6 +150,16 @@ sub map_to_dbi {
     _create_dbix_sequence_tables($MAPPINGS->{'!dbh'}{$class});
 }
 
+# This is used if you already have a dbh instead of creating one with 
+# map_to_dbi 
+sub set_dbh {
+    my ($class, $dbh) = @_;
+    confess "Cannot set an undefined dbh" unless defined $dbh;
+
+    $class = '!default' if $class eq 'Coat::Persistent';
+    $MAPPINGS->{'!dbh'}{$class} = $dbh;
+    _create_dbix_sequence_tables($MAPPINGS->{'!dbh'}{$class});
+}
 
 # This is done to wrap the original Coat::has method so we can
 # generate finders for each attribute declared
@@ -158,9 +179,26 @@ sub has_p {
     confess "package main called has_p" if $caller eq 'main';
 
     # unique field ?
-    $CONSTRAINTS->{'!unique'}{$caller}{$attr} = $options{unique} || 0;
-    # syntax check ?
-    $CONSTRAINTS->{'!syntax'}{$caller}{$attr} = $options{syntax} || undef;
+    if ($options{'unique'}) {
+        Coat::Persistent::Constraint->add_constraint('unique', $caller, $attr, 1);
+    }
+    
+    # specific storage type ?
+    if ($options{'store_as'}) {
+        # We need bi-directional coercion for this "store_as" feature ...
+        my $storage_type = Coat::Types::find_type_constraint($options{'store_as'});
+        confess "Unknown type \"".$options{'store_as'}."\" for storage" 
+            unless defined $storage_type;
+        confess "No coercion defined for storage type \"".$options{'store_as'}."\""
+            unless $storage_type->has_coercion;
+
+        my $type = Coat::Types::find_type_constraint($options{isa});
+        confess "No cercion for attribute type : \"".$options{isa}."\"" 
+            unless $type->has_coercion;
+
+        Coat::Persistent::Constraint->add_constraint('store_as', $caller, $attr, $options{'store_as'});
+        $options{coerce} = 1;
+    }
 
     Coat::has( $attr, ( '!caller' => $caller, %options ) );
     Coat::Persistent::Meta->attribute($caller, $attr);
@@ -507,16 +545,9 @@ sub validate {
     my $primary_key = Coat::Persistent::Meta->primary_key($class);
     
     foreach my $attr (Coat::Persistent::Meta->linearized_attributes($class) ) {
-        # checking for syntax validation
-        if (defined $CONSTRAINTS->{'!syntax'}{$class}{$attr}) {
-            my $regexp = $CONSTRAINTS->{'!syntax'}{$class}{$attr};
-            confess "Value \"".$self->$attr."\" for attribute \"$attr\" is not valid"
-                unless $self->$attr =~ /$regexp/;
-        }
         
         # checking for unique attributes on inserting (new objects)
-        if ((! defined $self->$primary_key) && 
-            $CONSTRAINTS->{'!unique'}{$class}{$attr}) {
+        if ($class->has_unique_constraint($attr)) {
             # look for other instances that already have that attribute
             my @items = $class->find(["$attr = ?", $self->$attr]);
             confess "Value ".$self->$attr." violates unique constraint "
@@ -524,7 +555,6 @@ sub validate {
                 if @items;
         }
     }
-
 }
 
 sub delete {
@@ -571,6 +601,39 @@ sub create {
     }
 }
 
+# This will return the value as to be stored in the underlying database
+# Most of the time it's just the value of the atrtribute, but it can 
+# be different if a 'store_as' type is defined.
+sub get_storage_value_for {
+    my ($self, $attr_name) = @_;
+    my $class = ref $self;
+
+    my $attr = Coat::Meta->attribute($class, $attr_name);
+
+    if ($attr->{store_as}) {
+        my $storing_type = Coat::Types::find_type_constraint($attr->{store_as});
+        return $storing_type->coerce($self->$attr_name);
+    }
+    else {
+        return $self->$attr_name;
+    }
+}
+
+# Takes a value (taken from the DB) and convert it to the real value for the attribute
+sub get_real_value_for {
+    my ($self, $attr_name, $value) = @_;
+    my $class = ref $self;
+
+    my $attr = Coat::Meta->attribute($class, $attr_name);
+    if ($attr->{store_as}) {
+        my $type = Coat::Types::find_type_constraint($attr->{isa});
+        return $type->coerce($value);
+    }
+    else {
+        return $value;
+    }
+}
+
 # serialize the instance and save it with the mapper defined
 sub save {
     my ($self) = @_;
@@ -588,8 +651,9 @@ sub save {
 
     # all the attributes of the class
     my @fields = Coat::Persistent::Meta->linearized_attributes( ref $self );
-    # a hash containing attr/value pairs for the current object.
-    my %values = map { $_ => $self->$_ } @fields;
+
+    # a hash containing attr/value pairs for the current object
+    my %values = map { $_ => $self->get_storage_value_for($_) } @fields;
 
     # if not a new object, we have to update
     if ( $self->_db_state == CP_ENTRY_EXISTS ) {
@@ -810,6 +874,24 @@ You can overide those conventions at import time:
             primary_key => 'mid';     # default would be 'id'
 
 =head1 CONFIGURATION
+
+You have two options for setting a database handle to your class. Either you
+already have a dbh an you set it to your class, or you don't and you let
+Coat::Persistent initialize it.
+
+If you already have a database handle, use Coat::Persistent->set_dbh($dbh),
+otherwise, use the DBI mapping explained below.
+
+=head2 Setting an existing database handle
+
+=over 4
+
+=item B<set_dbh($dbh)>
+
+Set the given database handle for the calling class (set it by default if class
+is Coat::Persistent).
+
+=back
 
 =head2 DBI MAPPING
 
