@@ -16,8 +16,9 @@ WriteMakefile(
         'DBD::CSV'       => '0', # needed for the test suite
         'SQL::Abstract'  => '0',
         'List::Compare'  => '0',
+        'Test::Database' => '0',
     },
-    test  => {TESTS => join( ' ', glob( 't/*.t' ))},
+    test  => {TESTS => join( ' ', (glob( 't/*.t'), glob('t/*/*.t')))},
     dist  => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean => { FILES => 't/csv-test-database'},
 );
