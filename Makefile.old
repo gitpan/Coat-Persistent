@@ -1,7 +1,7 @@
 # This Makefile is for the Coat::Persistent extension to perl.
 #
 # It was generated automatically by MakeMaker version
-# 6.54 (Revision: 65400) from the contents of
+# 6.52 (Revision: 65199) from the contents of
 # Makefile.PL. Don't edit this file, edit Makefile.PL instead.
 #
 #       ANY CHANGES MADE HERE WILL BE LOST!
@@ -18,7 +18,7 @@
 #     VERSION_FROM => q[lib/Coat/Persistent.pm]
 #     clean => { FILES=>q[t/csv-test-database] }
 #     dist => { COMPRESS=>q[gzip -9f], SUFFIX=>q[gz] }
-#     test => { TESTS=>q[t/001_csv_binding.t t/002_subobjects.t t/003_classes_scope.t t/004_default_dbh.t t/005_context.t t/006_find_by_sql.t t/007_unique.t t/008_syntax.t t/009_cache.t t/009_required_read_only.t t/010_update.t t/011_create.t t/012_find.t t/013_find_or_create.t t/014_find_or_init.t t/015_meta.t t/016_import.t t/017_rename.t t/018_find_with_undef.t t/019_mix.t t/019_state_object.t t/022_storage_value.t t/023_types_and_coercions.t t/024_undefined_primary_key.t t/test-database/001_auto_increment.t] }
+#     test => { TESTS=>q[t/001_csv_binding.t t/002_subobjects.t t/003_classes_scope.t t/004_default_dbh.t t/005_context.t t/006_find_by_sql.t t/007_unique.t t/008_syntax.t t/009_cache.t t/009_required_read_only.t t/010_update.t t/011_create.t t/012_find.t t/013_find_or_create.t t/014_find_or_init.t t/015_meta.t t/016_import.t t/017_rename.t t/018_find_with_undef.t t/019_mix.t t/019_state_object.t t/022_storage_value.t t/023_types_and_coercions.t t/024_undefined_primary_key.t t/test-database/001_mysql_auto_increment.t] }
 
 # --- MakeMaker post_initialize section:
 
@@ -38,11 +38,11 @@ FULL_AR = /usr/bin/ar
 LD = cc
 LDDLFLAGS = -shared -O2 -g -L/usr/local/lib
 LDFLAGS =  -L/usr/local/lib
-LIBC = /lib/libc-2.7.so
+LIBC = /lib/libc-2.9.so
 LIB_EXT = .a
 OBJ_EXT = .o
 OSNAME = linux
-OSVERS = 2.6.26-2-amd64
+OSVERS = 2.6.24-23-server
 RANLIB = :
 SITELIBEXP = /usr/local/share/perl/5.10.0
 SITEARCHEXP = /usr/local/lib/perl/5.10.0
@@ -137,8 +137,8 @@ PERM_RW = 644
 PERM_RWX = 755
 
 MAKEMAKER   = /usr/local/share/perl/5.10.0/ExtUtils/MakeMaker.pm
-MM_VERSION  = 6.54
-MM_REVISION = 65400
+MM_VERSION  = 6.52
+MM_REVISION = 65199
 
 # FULLEXT = Pathname for extension directory (eg Foo/Bar/Oracle).
 # BASEEXT = Basename part of FULLEXT. May be just equal FULLEXT. (eg Oracle)
@@ -189,7 +189,6 @@ PERL_ARCHIVE_AFTER =
 
 TO_INST_PM = lib/Coat/Persistent.pm \
 	lib/Coat/Persistent/Constraint.pm \
-	lib/Coat/Persistent/DBD.pm \
 	lib/Coat/Persistent/Meta.pm \
 	lib/Coat/Persistent/Object.pm \
 	lib/Coat/Persistent/Types.pm \
@@ -206,13 +205,11 @@ PM_TO_BLIB = lib/Coat/Persistent/Types/MySQL.pm \
 	lib/Coat/Persistent/Types.pm \
 	blib/lib/Coat/Persistent/Types.pm \
 	lib/Coat/Persistent.pm \
-	blib/lib/Coat/Persistent.pm \
-	lib/Coat/Persistent/DBD.pm \
-	blib/lib/Coat/Persistent/DBD.pm
+	blib/lib/Coat/Persistent.pm
 
 
 # --- MakeMaker platform_constants section:
-MM_Unix_VERSION = 6.54
+MM_Unix_VERSION = 6.52
 PERL_MALLOC_DEF = -DPERL_EXTMALLOC_DEF -Dmalloc=Perl_malloc -Dfree=Perl_mfree -Drealloc=Perl_realloc -Dcalloc=Perl_calloc
 
 
@@ -529,7 +526,7 @@ metafile : create_distdir
 	$(NOECHO) $(ECHO) '    directory:' >> META_new.yml
 	$(NOECHO) $(ECHO) '        - t' >> META_new.yml
 	$(NOECHO) $(ECHO) '        - inc' >> META_new.yml
-	$(NOECHO) $(ECHO) 'generated_by:       ExtUtils::MakeMaker version 6.54' >> META_new.yml
+	$(NOECHO) $(ECHO) 'generated_by:       ExtUtils::MakeMaker version 6.52' >> META_new.yml
 	$(NOECHO) $(ECHO) 'meta-spec:' >> META_new.yml
 	$(NOECHO) $(ECHO) '    url:      http://module-build.sourceforge.net/META-spec-v1.4.html' >> META_new.yml
 	$(NOECHO) $(ECHO) '    version:  1.4' >> META_new.yml
@@ -797,7 +794,7 @@ $(MAKE_APERL_FILE) : $(FIRST_MAKEFILE) pm_to_blib
 TEST_VERBOSE=0
 TEST_TYPE=test_$(LINKTYPE)
 TEST_FILE = test.pl
-TEST_FILES = t/001_csv_binding.t t/002_subobjects.t t/003_classes_scope.t t/004_default_dbh.t t/005_context.t t/006_find_by_sql.t t/007_unique.t t/008_syntax.t t/009_cache.t t/009_required_read_only.t t/010_update.t t/011_create.t t/012_find.t t/013_find_or_create.t t/014_find_or_init.t t/015_meta.t t/016_import.t t/017_rename.t t/018_find_with_undef.t t/019_mix.t t/019_state_object.t t/022_storage_value.t t/023_types_and_coercions.t t/024_undefined_primary_key.t t/test-database/001_auto_increment.t
+TEST_FILES = t/001_csv_binding.t t/002_subobjects.t t/003_classes_scope.t t/004_default_dbh.t t/005_context.t t/006_find_by_sql.t t/007_unique.t t/008_syntax.t t/009_cache.t t/009_required_read_only.t t/010_update.t t/011_create.t t/012_find.t t/013_find_or_create.t t/014_find_or_init.t t/015_meta.t t/016_import.t t/017_rename.t t/018_find_with_undef.t t/019_mix.t t/019_state_object.t t/022_storage_value.t t/023_types_and_coercions.t t/024_undefined_primary_key.t t/test-database/001_mysql_auto_increment.t
 TESTDB_SW = -d
 
 testdb :: testdb_$(LINKTYPE)
@@ -843,15 +840,14 @@ ppd :
 
 # --- MakeMaker pm_to_blib section:
 
-pm_to_blib : $(FIRST_MAKEFILE) $(TO_INST_PM)
+pm_to_blib : $(TO_INST_PM)
 	$(NOECHO) $(ABSPERLRUN) -MExtUtils::Install -e 'pm_to_blib({@ARGV}, '\''$(INST_LIB)/auto'\'', q[$(PM_FILTER)], '\''$(PERM_DIR)'\'')' -- \
 	  lib/Coat/Persistent/Types/MySQL.pm blib/lib/Coat/Persistent/Types/MySQL.pm \
 	  lib/Coat/Persistent/Object.pm blib/lib/Coat/Persistent/Object.pm \
 	  lib/Coat/Persistent/Constraint.pm blib/lib/Coat/Persistent/Constraint.pm \
 	  lib/Coat/Persistent/Meta.pm blib/lib/Coat/Persistent/Meta.pm \
 	  lib/Coat/Persistent/Types.pm blib/lib/Coat/Persistent/Types.pm \
-	  lib/Coat/Persistent.pm blib/lib/Coat/Persistent.pm \
-	  lib/Coat/Persistent/DBD.pm blib/lib/Coat/Persistent/DBD.pm 
+	  lib/Coat/Persistent.pm blib/lib/Coat/Persistent.pm 
 	$(NOECHO) $(TOUCH) pm_to_blib
 
 
